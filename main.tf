@@ -10,7 +10,7 @@ terraform {
 }
 
 provider "aws" {
-  profile = "cloudops" #<-- Change profile name as needed to match aws cli connection in dev environment
+  profile = "bgrweb" #<-- Change profile name as needed to match aws cli connection in dev environment
   region = "us-east-1"
 }
 
@@ -61,39 +61,38 @@ resource "aws_apigatewayv2_stage" "DemoHTTPApiStage" {
   auto_deploy = true
 }
 
-# Create an IAM role for API Gateway
-resource "aws_iam_role" "APIGWRole" {
-  assume_role_policy = <<POLICY1
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Principal": {
-          "Service": "apigateway.amazonaws.com"
-        },
-          "Action": "sts:AssumeRole"
-      }
-    ]
+# Create a Policy Doc for API Gateway to assume role in order to use EventBridge
+data "aws_iam_policy_document" "APIGWRole_Doc" {
+  statement {
+    actions = ["sts:AssumeRole" ]
+    principals {
+      type = "Service"
+      identifiers = ["apigateway.amazonaws.com"]
+    }
+    effect = "Allow"
   }
-  POLICY1
+}
+# -- Create the IAM role for APIGateway that uses the above policy doc
+resource "aws_iam_role" "APIGWRole" {
+  assume_role_policy = data.aws_iam_policy_document.APIGWRole_Doc.json
+  name = "APIGW-EB-Role"
+  description = "Role for API Gateway to use EventBridge"
 }
 
 
-# Create an IAM policy for API Gateway to write to an EventBridge event
-resource "aws_iam_policy" "APIGWPolicy" {
-  policy = <<POLICY2
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": "events:PutEvents",
-        "Resource": "${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}"
-      }
-    ]
+# Create a Policy Doc for API Gateway to write to an EventBridge event
+data "aws_iam_policy_document" "APIGWPolicy_doc" {
+  statement {
+    actions = ["events:PutEvents"]  
+    resources = ["arn:aws:events:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}"]
+    effect = "Allow"
   }
-  POLICY2
+}
+# -- Create the IAM role to use the json of the above-created policy doc
+resource "aws_iam_policy" "APIGWPolicy" {
+  name = "APIGW-EB-Policy"
+  description = "Policy for API Gateway to write to an EventBridge event"
+  policy = data.aws_iam_policy_document.APIGWPolicy_doc.json
 }
 
 # Attach the IAM policy to the IAM role
@@ -104,9 +103,9 @@ resource "aws_iam_role_policy_attachment" "APIGWPolicyAttachment" {
 
 # Create an EventBridge rule
 resource "aws_cloudwatch_event_rule" "EventBridgeRule" {
-  event_pattern = <<PATTERN
+  event_pattern =<<PATTERN
   {
-    "account": ["${data.aws_caller_identity.current.account_id}"]
+    "account": ["${data.aws_caller_identity.current.account_id}"],
     "source": ["demo.apigw"]
   }
   PATTERN
@@ -130,11 +129,11 @@ data "archive_file" "LambdaZip" {
 # - prefix the function name with the name of the API Gateway (optional)
 # - for lambda layer, get latest arn here: https://docs.powertools.aws.dev/lambda/python/latest/
 resource "aws_lambda_function" "DemoLambdaFunction" {
-  function_name = "${aws_apigatewayv2_api.DemoHTTPApi.name}-DemoLambdaFunction"
+  function_name = "DemoHTTPApi-Function-${data.aws_caller_identity.current.user_id}"
   filename = data.archive_file.LambdaZip.output_path
   source_code_hash = filebase64sha256(data.archive_file.LambdaZip.output_path)
   handler = "main.lambda_handler"
-  runtime = "python3.12"
+  runtime = "python3.9"
   role = aws_iam_role.LambdaRole.arn
   layers = ["arn:aws:lambda:${data.aws_region.current.name}:017000801446:layer:AWSLambdaPowertoolsPythonV2:59"]
 }
@@ -149,43 +148,36 @@ resource "aws_lambda_permission" "EventBridgeInvokeLambdaPermission" {
   source_arn = aws_cloudwatch_event_rule.EventBridgeRule.arn
 }
 
-# Create an IAM role for Lambda
-resource "aws_iam_role" "LambdaRole" {
-  assume_role_policy = <<POLICY3
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Principal": {
-          "Service": "lambda.amazonaws.com"
-        },
-          "Action": "sts:AssumeRole"
-      }
-    ]
+# Create a Policy Doc for an IAM role for Lambda (using data object)
+data "aws_iam_policy_document" "LambdaRole_doc" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+    effect = "Allow"
   }
-  POLICY3
+}
+# Use the above-created Policy Doc data object the new IAM role for Lambda
+resource "aws_iam_role" "LambdaRole" {
+  assume_role_policy = data.aws_iam_policy_document.LambdaRole_doc.json
+  name = "Lambda-Role-${data.aws_caller_identity.current.user_id}"
 }
 
 
 # Create an IAM policy for Lambda to write to CloudWatch logs to the log-group:/aws/lambda
-resource "aws_iam_policy" "LambdaPolicy" {
-  policy = <<POLICY4
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ],
-        "Resource": "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/*"
-      }
-    ]
+data "aws_iam_policy_document" "LambdaPolicy_doc" {
+  statement {
+    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/*"]
+    effect = "Allow"
   }
-  POLICY4
+}
+resource "aws_iam_policy" "LambdaPolicy" {
+  name = "Lambda-Log-Policy"
+  description = "Policy for Lambda to write to CloudWatch logs"
+  policy = data.aws_iam_policy_document.LambdaPolicy_doc.json
 }
 
 # Attach the IAM policy to the IAM role
@@ -197,7 +189,7 @@ resource "aws_iam_role_policy_attachment" "LambdaPolicyAttachment" {
 # Create a CloudWatch log group for the Lambda function
 resource "aws_cloudwatch_log_group" "DemoLogGroup" {
   name = "/aws/lambda/${aws_lambda_function.DemoLambdaFunction.function_name}"
-  retention_in_days = 10
+  retention_in_days = 7
 }
 
 
